@@ -1,0 +1,259 @@
+CREATE DATABASE movies;
+CREATE SCHEMA staging;
+
+CREATE TABLE staging.users
+(
+    user_id string,
+    first_name string,
+    last_name string,
+    birth_date string,
+    country string,
+    registration_date string
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+CREATE TABLE staging.ratings
+(
+    user_id string,
+    movie_id string,
+    rating string,
+    created_at string
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+CREATE TABLE staging.tags
+(
+    user_id string,
+    movie_id string,
+    tag string,
+    created_at string
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+CREATE TABLE staging.movies
+(
+    movie_id string,
+    title string,
+    genres string
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+LOAD DATA INPATH 'hdfs:///data_lake/movies/users.csv' INTO TABLE staging.users;
+LOAD DATA INPATH 'hdfs:///data_lake/movies/ratings.csv' INTO TABLE staging.ratings;
+LOAD DATA INPATH 'hdfs:///data_lake/movies/tags.csv' INTO TABLE staging.tags;
+LOAD DATA INPATH 'hdfs:///data_lake/movies/movies.csv' INTO TABLE staging.movies;
+
+------------------------------
+
+CREATE TABLE staging.users_with_reg_year_and_appropriate_types
+(
+    user_id int,
+    first_name string,
+    last_name string,
+    birth_date date,
+    country string,
+    registration_date date,
+    registration_year smallint
+)
+STORED AS PARQUET;
+
+INSERT INTO staging.users_with_reg_year_and_appropriate_types
+SELECT
+    cast(u.user_id as int) user_id,
+    u.first_name,
+    u.last_name,
+    to_date(from_unixtime(unix_timestamp(u.birth_date, 'MM/dd/yyyy'))) birth_date,
+    u.country,
+    to_date(from_unixtime(unix_timestamp(u.registration_date, 'MM/dd/yyyy'))) registration_date,
+    year(to_date(from_unixtime(unix_timestamp(u.registration_date, 'MM/dd/yyyy')))) registration_year
+FROM staging.users u;
+
+CREATE EXTERNAL TABLE movies.users_partitioned
+(
+    user_id int,
+    first_name string,
+    last_name string,
+    birth_date date,
+    registration_date date
+)
+PARTITIONED BY (country string, registration_year smallint)
+STORED AS PARQUET
+LOCATION 'hdfs:///data_lake/partitioning';
+
+set hive.exec.dynamic.partition = true;
+set hive.exec.dynamic.partition.mode = nonstrict;
+
+INSERT INTO movies.users_partitioned
+PARTITION(country, registration_year)
+SELECT 
+    user_id,
+    first_name,
+    last_name,
+    birth_date,
+    registration_date,
+    country,
+    registration_year
+FROM staging.users_with_reg_year_and_appropriate_types;
+
+------------------------------
+
+CREATE EXTERNAL TABLE movies.tags_with_list_and_appropriate_types
+(
+    user_id int,
+    movie_id int,
+    tags array<string>
+)
+STORED AS PARQUET;
+
+INSERT INTO movies.tags_with_list_and_appropriate_types
+SELECT 
+    cast(t.user_id as int) user_id,
+    cast(t.movie_id as int) movie_id,
+    collect_list(t.tag) as tag_set
+FROM staging.tags t
+GROUP BY user_id, movie_id;
+
+------------------------------
+
+CREATE EXTERNAL TABLE staging.movies_with_appropriate_types
+(
+    movie_id int,
+    title string,
+    movie_year int,
+    genres array<string>
+)
+STORED AS PARQUET;
+
+INSERT INTO staging.movies_with_appropriate_types
+SELECT
+    cast(m.movie_id as int),
+    cast(concat_ws(' ', IF(locate(':', m.title) != 0, substr(m.title, locate(':', m.title) + 1, (length(substr(m.title, locate(':', m.title) + 2)) - 
+    6)), ''), substr(m.title, 0, length(m.title) - IF(locate(':', m.title) != 0, length(substr(m.title, locate(':', m.title))), 6))) as string),
+    cast(substr(m.title, length(m.title) - 4, 4) as int),
+    split(m.genres, '\\|')
+FROM staging.movies m;
+
+
+CREATE EXTERNAL TABLE movies.genres_table
+(
+    genre_id int,
+    genre_name string
+)
+STORED AS PARQUET;
+
+INSERT INTO movies.genres_table
+SELECT 
+    cast(rand() * 10000000 as int) as random_key,
+    genr
+FROM staging.movies_with_appropriate_types
+lateral view explode(genres) gen as genr
+GROUP BY genr;
+
+CREATE EXTERNAL TABLE movies.movies_final
+(
+    movie_id int,
+    title string,
+    movie_year int,
+    genres array<int>
+)
+STORED AS PARQUET;
+
+INSERT INTO movies.movies_final
+SELECT m.movie_id, m.title, m.movie_year, collect_set(g.genre_id)
+FROM (select n.movie_id, n.title, n.movie_year, genr FROM staging.movies_with_appropriate_types n LATERAL VIEW explode(genres) gen as genr) as m
+JOIN movies.genres_table g ON m.genr = g.genre_name
+GROUP BY m.movie_id, m.title, m.movie_year;
+
+----------------------------------
+
+CREATE EXTERNAL TABLE movies.ratings_with_appropriate_types
+(
+    user_id int,
+    movie_id int,
+    rating int,
+    created_at timestamp
+)
+STORED AS PARQUET;
+
+INSERT INTO movies.ratings_with_appropriate_types
+SELECT
+    cast(r.user_id as int) user_id,
+    cast(r.movie_id as int) movie_id,
+    cast(r.rating as int) rating,
+    from_unixtime(unix_timestamp(r.created_at, 'MM/dd/yyyy HH:mm:ss')) as created_at
+FROM staging.ratings r;
+
+
+--------------------------amocanebi
+--------------------------1 
+SELECT 
+    movie_id as movie_id,
+    year(created_at) as movie_year,
+    avg(rating) as average_rating
+FROM movies.ratings_with_appropriate_types
+GROUP BY movie_id, year(created_at)
+ORDER BY movie_id ASC, movie_year ASC;
+
+
+-----------------------------2
+SELECT 
+    title as title,
+    avg(rating) as average_rating,
+    count(r.rating) as rating_count
+FROM movies.movies_final m
+JOIN movies.ratings_with_appropriate_types r ON m.movie_id = r.movie_id
+GROUP BY title
+HAVING average_rating > 4
+AND rating_count >= 100
+
+------------------------------3
+SELECT count(distinct u.user_id) - count(distinct r.user_id)
+FROM movies.ratings_with_appropriate_types r
+RIGHT JOIN movies.users_partitioned u ON u.user_id = r.user_id
+
+------------------------------4
+SELECT 
+    m.user_id,
+    concat_ws(' ', u.first_name, u.last_name) as full_name,
+    m.movie_id,
+    mo.title
+FROM (SELECT user_id, movie_id, tg.tags FROM movies.tags_with_list_and_appropriate_types LATERAL VIEW explode(tags) tg as tags) as m
+JOIN movies.users_partitioned u ON u.user_id = m.user_id
+JOIN movies.movies_final mo ON mo.movie_id = m.movie_id
+GROUP BY m.user_id, concat_ws(' ', u.first_name, u.last_name),  m.movie_id, mo.title, m.tags
+HAVING count(m.tags) > 1;
+
+------------------------------5
+SELECT 
+    mo.title,
+    count(distinct m.tags) as tag_count,
+    collect_set(m.tags) as tag_set
+FROM (SELECT movie_id, tg.tags FROM movies.tags_with_list_and_appropriate_types LATERAL VIEW explode(tags) tg as tags) as m
+JOIN movies.movies_final mo ON mo.movie_id = m.movie_id
+GROUP BY mo.title
+ORDER BY tag_count DESC
+LIMIT 3;
+
+------------------------------6
+SELECT * 
+FROM (
+    SELECT 
+        mo.title,
+        sum(rating) as rating_sum,
+        avg(rating) as average_rating
+    FROM movies.ratings_with_appropriate_types r
+    JOIN movies.movies_final mo ON mo.movie_id = r.movie_id
+    WHERE year(r.created_at) BETWEEN 2005 AND 2015
+    GROUP BY mo.title
+    HAVING average_rating >= 4
+    ORDER BY rating_sum DESC
+    LIMIT 10) as filtered
+ORDER BY filtered.average_rating DESC;
